@@ -1,110 +1,167 @@
+#define _POSIX_C_SOURCE 200809L
+#include <unistd.h>
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/types.h>
+#include <stdbool.h>
+#include <time.h>
 
-// ✅ Your constants and struct, slightly improved
 #define MAX_COMMAND 256
-#define MAX_TTY 32
-#define MAX_WCHAN 32
+#define MAX_WCHAN   32
+#define MAX_TTY     32
+#define MAX_TOKENS  52
+
 
 typedef struct {
-  unsigned int flags;
-  char state;
-  unsigned int uid;
-  unsigned int pid;
-  unsigned int ppid;
-  int priority;
-  int nice;
-  unsigned int rss;
-  unsigned int sz;
-  char wchan[MAX_WCHAN];
-  char tty[MAX_TTY]; // 🆕 We’ll use placeholder text for now
-  unsigned long time;
-  char cmd[MAX_COMMAND];
+    char         state;
+    unsigned int uid;
+    unsigned int pid;
+    unsigned int ppid;
+    unsigned int c;
+    int          priority;
+    int          nice;
+    unsigned int rss;
+    unsigned int sz;
+    char         wchan[MAX_WCHAN];
+    char         tty[MAX_TTY];
+    unsigned long time;
+    char         cmd[MAX_COMMAND];
 } entry;
 
-// 🆕 Forward declaration
 void processId(const char *pid);
+char *format_time(unsigned long total_secs);
 
-// ✅ Your `main` function, fixed
-int main() {
-  DIR *dir;
-  struct dirent *ent;
 
-  if (!(dir = opendir("/proc"))) {
-    perror("opendir");
-    return 1;
-  }
+int main(void) {
+    
+    DIR *dir;
+    struct dirent *ent;
+    printf("pid\tstate\tuid\tppid\tc\tpri\tnice\trss\tsz\twchan\ttty\ttime\tcmd\n");
 
-  // 🆕 Print headers
-  printf("%-5s %-2s %-5s %-5s %-3s %-3s %-6s %-6s %-8s %-5s %-8s %s\n", "UID",
-         "S", "PID", "PPID", "PR", "NI", "SZ", "RSS", "WCHAN", "TTY", "TIME",
-         "CMD");
+    if (!(dir = opendir("/proc"))) {
+        perror("opendir");
+        return 1;
+    }
 
-  while ((ent = readdir(dir)) != NULL) {
-    if (!isdigit(ent->d_name[0]))
-      continue;
-    processId(ent->d_name);
-  }
+    while ((ent = readdir(dir)) != NULL) {
+        if (!isdigit(ent->d_name[0]))
+            continue;
+        processId(ent->d_name);
+    }
 
-  closedir(dir);
-  return 0;
+    closedir(dir);
+    return 0;
 }
 
-// ✅ Your helper, rebuilt and extended
 void processId(const char *pid) {
-  char path[64], line[256];
+  long ticks = sysconf(_SC_CLK_TCK);
+  char path[64], line[1024];
   FILE *fp;
   entry e = {0};
-  unsigned long utime = 0, stime = 0;
+  char *tokens[MAX_TOKENS];
+  int i = 0;
 
-  // ✅ Read /proc/[pid]/stat
+  e.pid = atoi(pid);
+   e.c = 0;
   snprintf(path, sizeof(path), "/proc/%s/stat", pid);
-  if (!(fp = fopen(path, "r")))
-    return;
+  if (!(fp = fopen(path, "r"))) {
+      return;
+  }
+  if (fgets(line, sizeof(line), fp)) {
+      char *tok = strtok(line, " ");
+      while (tok && i < MAX_TOKENS) {
+          if(i == 1) {
+              size_t len = strlen(tok);
+              tok[len - 1] = '\0';
+              tokens[i] = tok + 1;
+          }
+          else {
+              tokens[i] = tok;
+          }
+          tok = strtok(NULL, " ");
+          i++;
+      }
+      
+      
+      strncpy(e.cmd, tokens[1], sizeof(e.cmd)-1);
+      e.cmd[sizeof(e.cmd)-1] = '\0';
+      e.state = tokens[2][0];
+      e.ppid = atoi(tokens[3]);
+      strncpy(e.tty, tokens[6], sizeof(e.tty)-1);
+      e.tty[sizeof(e.tty)-1] = '\0';
+      e.time = (atoi(tokens[13]) + atoi(tokens[14])) / ticks;
+      e.priority = atoi(tokens[17]);
+      e.nice = atoi(tokens[18]);
+      strncpy(e.wchan, tokens[34], sizeof(e.wchan)-1);
+      e.wchan[sizeof(e.wchan)-1] = '\0';
 
-  char comm[256]; // 🆕 Needed because (comm) has spaces
-  fscanf(fp,
-         "%u %s %c %u %*d %*d %d %*d %u %*u %*u %*u %*u %lu %lu %*d %*d %*d %d "
-         "%d %*u %lu %lu",
-         &e.pid, comm, &e.state, &e.ppid,
-         &e.tty, // tty_nr
-         &e.flags, &utime, &stime, &e.priority, &e.nice, &e.sz, &e.rss);
+  }
   fclose(fp);
 
-  e.time = utime + stime;
-
-  // 🆕 Read /proc/[pid]/status for UID and CMD
   snprintf(path, sizeof(path), "/proc/%s/status", pid);
-  if ((fp = fopen(path, "r"))) {
-    while (fgets(line, sizeof(line), fp)) {
-      if (sscanf(line, "Uid:\t%u", &e.uid) == 1)
-        continue;
-      if (sscanf(line, "Name:\t%255s", e.cmd) == 1)
-        continue;
-    }
-    fclose(fp);
+  if (!(fp = fopen(path, "r"))) {
+      return;
   }
-
-  // 🆕 Read /proc/[pid]/wchan
-  snprintf(path, sizeof(path), "/proc/%s/wchan", pid);
-  if ((fp = fopen(path, "r"))) {
-    fscanf(fp, "%31s", e.wchan);
-    fclose(fp);
-  } else {
-    strcpy(e.wchan, "-");
+  bool foundUID = false, foundSize = false, foundRSS = false;
+  while (fgets(line, sizeof(line), fp)) {
+      char *colon = strchr(line, ':');
+      *colon = '\0';
+      char*key = line;
+      char*value = colon + 1;
+      while (*value == '\t' || *value == ' ') {
+          value++;
+      }
+      char *end = strchr(value, '\n');
+      if(end) {
+          *end = '\0';
+      }
+      if (!strcmp(key, "Uid")) {
+          unsigned int r_uid;
+          if (sscanf(value, "%u", &r_uid) == 1) {
+              e.uid = r_uid;
+              foundUID = true;
+          }
+      }
+      else if (!strcmp(key, "VmSize")) {
+          e.sz = atoi(value);
+          foundSize = true;
+      }
+      else if (!strcmp(key, "VmRSS")) {
+          e.rss = atoi(value);
+          foundRSS = true;
+      }
+      if (foundUID && foundSize && foundRSS) {
+          break;
+      }
   }
+  fclose(fp);
+  char *time = format_time(e.time);
+  printf("%u\t%c\t%u\t%u\t%u\t%d\t%d\t%u\t%u\t%s\t%s\t%s\t%s\n",
+    e.pid,
+    e.state,
+    e.uid,
+    e.ppid,
+    e.c,
+    e.priority,
+    e.nice,
+    e.rss,
+    e.sz,
+    e.wchan,
+    e.tty,
+    time,         
+    e.cmd);
 
-  // 🆕 TTY placeholder — decoding tty_nr requires mapping major/minor to device
-  // (complex)
-  strcpy(e.tty, "?");
-
-  // 🆕 Print formatted output
-  printf("%-5u %-2c %-5u %-5u %-3d %-3d %-6u %-6u %-8s %-5s %-8lu %s\n", e.uid,
-         e.state, e.pid, e.ppid, e.priority, e.nice, e.sz, e.rss, e.wchan,
-         e.tty, e.time, e.cmd);
+    free(time);
+  }
+  char *format_time(unsigned long total_secs) {
+    char *buf = malloc(10);
+    unsigned int hours   = total_secs / 3600;
+    unsigned int minutes = (total_secs % 3600) / 60;
+    unsigned int seconds = total_secs % 60;
+    snprintf(buf,10, "%02u:%02u:%02u", hours, minutes, seconds);
+    return buf;
 }
+
